@@ -228,17 +228,42 @@ async function startServer() {
     }
   });
 
-  const ADMIN_PASSWORD = "admin123";
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+
+  function verifyAdminAuth(req: express.Request): boolean {
+    const authHeader = req.headers.authorization;
+    const customHeader = req.headers["x-admin-password"];
+    const bodyPassword = req.body?.password;
+    const queryPassword = req.query?.password;
+
+    const provided =
+      customHeader ||
+      (authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : authHeader) ||
+      bodyPassword ||
+      queryPassword;
+
+    return provided === ADMIN_PASSWORD;
+  }
 
   app.post("/api/admin/import", (req, res) => {
-    const { password, leads } = req.body;
-
-    if (password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ error: "Invalid admin password" });
+    if (!verifyAdminAuth(req)) {
+      return res.status(401).json({ error: "Invalid admin authentication credentials" });
     }
+
+    const { leads } = req.body;
 
     if (!Array.isArray(leads)) {
       return res.status(400).json({ error: "leads must be an array" });
+    }
+
+    // Validate item schemas
+    for (let i = 0; i < leads.length; i++) {
+      const lead = leads[i];
+      if (!lead || typeof lead !== "object" || typeof lead.name !== "string" || !lead.name.trim()) {
+        return res.status(400).json({
+          error: `Invalid lead object at index ${i}: 'name' is required and must be a string`,
+        });
+      }
     }
 
     try {
@@ -251,67 +276,87 @@ async function startServer() {
         const results = [];
         for (const lead of leadList) {
           const info = insertStmt.run(
-            lead.name,
-            lead.company || null,
-            lead.email || null,
-            lead.phone || null,
-            lead.status || "New",
-            lead.value || 0,
-            lead.notes || ""
+            lead.name.trim(),
+            typeof lead.company === "string" ? lead.company : null,
+            typeof lead.email === "string" ? lead.email : null,
+            typeof lead.phone === "string" ? lead.phone : null,
+            typeof lead.status === "string" ? lead.status : "New",
+            typeof lead.value === "number" ? lead.value : 0,
+            typeof lead.notes === "string" ? lead.notes : ""
           );
           results.push(info.lastInsertRowid);
-
-          console.debug(`[import] Imported lead: ${JSON.stringify(lead)}`);
         }
         return results;
       });
 
       const importedIds = insertMany(leads);
 
-      console.debug(`[import] Bulk import complete: ${importedIds.length} leads imported`);
+      console.log(`[import] Bulk import complete: ${importedIds.length} leads imported`);
       res.status(201).json({
         message: `Successfully imported ${importedIds.length} leads`,
         ids: importedIds,
       });
     } catch (error: any) {
-      res.status(500).json({ error: "Import failed", details: error.message });
+      console.error("[import] Error importing leads:", error);
+      res.status(500).json({ error: "Import failed due to an internal server error" });
     }
   });
 
   app.get("/api/admin/export", (req, res) => {
-    const { password } = req.query;
-
-    if (password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ error: "Invalid admin password" });
+    if (!verifyAdminAuth(req)) {
+      return res.status(401).json({ error: "Invalid admin authentication credentials" });
     }
 
     try {
       const leads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC").all();
 
-      const filename = (req.query.filename as string) || "export.csv";
-      console.debug(`[export] Exporting to filename: ${filename}`);
+      const rawFilename = (req.query.filename as string) || "export.csv";
+      // Prevent path traversal by extracting basename and sanitizing
+      const safeFilename = path.basename(rawFilename).replace(/[^a-zA-Z0-9_.-]/g, "_");
+
+      const escapeCsv = (val: any) => {
+        if (val === null || val === undefined) return '""';
+        let str = String(val);
+        // Formula injection protection for spreadsheet software
+        if (/^[=+\-@]/.test(str)) {
+          str = "'" + str;
+        }
+        return `"${str.replace(/"/g, '""')}"`;
+      };
 
       const headers = "id,name,company,email,phone,status,value,notes,created_at\n";
       const rows = leads
-        .map(
-          (l: any) =>
-            `${l.id},"${l.name}","${l.company || ""}","${l.email || ""}","${l.phone || ""}","${l.status}",${l.value},"${l.notes || ""}","${l.created_at}"`
+        .map((l: any) =>
+          [
+            l.id,
+            escapeCsv(l.name),
+            escapeCsv(l.company),
+            escapeCsv(l.email),
+            escapeCsv(l.phone),
+            escapeCsv(l.status),
+            typeof l.value === "number" ? l.value : 0,
+            escapeCsv(l.notes),
+            escapeCsv(l.created_at),
+          ].join(",")
         )
         .join("\n");
 
-      const filePath = path.join(__dirname, filename);
+      console.log(`[export] Exporting ${leads.length} leads to ${safeFilename}`);
 
-      fs.writeFileSync(filePath, headers + rows);
-
-      console.debug(`[export] Exported ${leads.length} leads: ${JSON.stringify(leads)}`);
-
-      res.download(filePath, filename);
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+      res.send(headers + rows);
     } catch (error: any) {
-      res.status(500).json({ error: "Export failed", details: error.message });
+      console.error("[export] Error exporting leads:", error);
+      res.status(500).json({ error: "Export failed due to an internal server error" });
     }
   });
 
   app.get("/api/admin/stats", (req, res) => {
+    if (!verifyAdminAuth(req)) {
+      return res.status(401).json({ error: "Invalid admin authentication credentials" });
+    }
+
     try {
       const totalLeads = db.prepare("SELECT COUNT(*) as count FROM leads").get() as any;
       const byStatus = db.prepare("SELECT status, COUNT(*) as count FROM leads GROUP BY status").all();
@@ -319,7 +364,7 @@ async function startServer() {
       const recentLeads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC LIMIT 10").all();
       const totalMeetings = db.prepare("SELECT COUNT(*) as count FROM meetings").get() as any;
 
-      console.debug(`[stats] Recent leads data: ${JSON.stringify(recentLeads)}`);
+      console.log(`[stats] Fetched admin stats. Total leads: ${totalLeads.count}`);
 
       res.json({
         total_leads: totalLeads.count,
@@ -329,7 +374,8 @@ async function startServer() {
         total_meetings: totalMeetings.count,
       });
     } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch stats", details: error.message });
+      console.error("[stats] Error fetching stats:", error);
+      res.status(500).json({ error: "Failed to fetch stats due to an internal server error" });
     }
   });
 
