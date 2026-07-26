@@ -2,6 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -81,7 +82,7 @@ async function startServer() {
         INSERT INTO lead_notes (lead_id, content, type)
         VALUES (?, ?, ?)
       `).run(id, content, type || 'general');
-      
+
       const newNote = db.prepare("SELECT * FROM lead_notes WHERE id = ?").get(info.lastInsertRowid);
       res.status(201).json(newNote);
     } catch (error) {
@@ -111,7 +112,7 @@ async function startServer() {
         INSERT INTO meetings (lead_id, title, meeting_date, notes)
         VALUES (?, ?, ?, ?)
       `).run(lead_id, title, meeting_date, notes || '');
-      
+
       if (notes) {
         db.prepare(`
           INSERT INTO lead_notes (lead_id, content, type)
@@ -131,13 +132,13 @@ async function startServer() {
     const { title, meeting_date, notes, is_completed } = req.body;
     try {
       const oldMeeting = db.prepare("SELECT * FROM meetings WHERE id = ?").get(id);
-      
+
       db.prepare(`
         UPDATE meetings 
         SET title = ?, meeting_date = ?, notes = ?, is_completed = ?
         WHERE id = ?
       `).run(title, meeting_date, notes, is_completed ? 1 : 0, id);
-      
+
       // If notes changed or meeting completed, add to log
       if (notes && notes !== oldMeeting.notes) {
         db.prepare(`
@@ -175,7 +176,7 @@ async function startServer() {
         INSERT INTO leads (name, company, email, phone, status, value, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(name, company, email, phone, status || 'New', value || 0, notes || '');
-      
+
       const leadId = info.lastInsertRowid;
       if (notes) {
         db.prepare(`
@@ -196,13 +197,13 @@ async function startServer() {
     const { name, company, email, phone, status, value, notes } = req.body;
     try {
       const oldLead = db.prepare("SELECT * FROM leads WHERE id = ?").get(id);
-      
+
       db.prepare(`
         UPDATE leads 
         SET name = ?, company = ?, email = ?, phone = ?, status = ?, value = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `).run(name, company, email, phone, status, value, notes, id);
-      
+
       if (notes && notes !== oldLead.notes) {
         db.prepare(`
           INSERT INTO lead_notes (lead_id, content, type)
@@ -224,6 +225,157 @@ async function startServer() {
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to delete lead" });
+    }
+  });
+
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+
+  function verifyAdminAuth(req: express.Request): boolean {
+    const authHeader = req.headers.authorization;
+    const customHeader = req.headers["x-admin-password"];
+    const bodyPassword = req.body?.password;
+    const queryPassword = req.query?.password;
+
+    const provided =
+      customHeader ||
+      (authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : authHeader) ||
+      bodyPassword ||
+      queryPassword;
+
+    return provided === ADMIN_PASSWORD;
+  }
+
+  app.post("/api/admin/import", (req, res) => {
+    if (!verifyAdminAuth(req)) {
+      return res.status(401).json({ error: "Invalid admin authentication credentials" });
+    }
+
+    const { leads } = req.body;
+
+    if (!Array.isArray(leads)) {
+      return res.status(400).json({ error: "leads must be an array" });
+    }
+
+    // Validate item schemas
+    for (let i = 0; i < leads.length; i++) {
+      const lead = leads[i];
+      if (!lead || typeof lead !== "object" || typeof lead.name !== "string" || !lead.name.trim()) {
+        return res.status(400).json({
+          error: `Invalid lead object at index ${i}: 'name' is required and must be a string`,
+        });
+      }
+    }
+
+    try {
+      const insertStmt = db.prepare(`
+        INSERT INTO leads (name, company, email, phone, status, value, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const insertMany = db.transaction((leadList: any[]) => {
+        const results = [];
+        for (const lead of leadList) {
+          const info = insertStmt.run(
+            lead.name.trim(),
+            typeof lead.company === "string" ? lead.company : null,
+            typeof lead.email === "string" ? lead.email : null,
+            typeof lead.phone === "string" ? lead.phone : null,
+            typeof lead.status === "string" ? lead.status : "New",
+            typeof lead.value === "number" ? lead.value : 0,
+            typeof lead.notes === "string" ? lead.notes : ""
+          );
+          results.push(info.lastInsertRowid);
+        }
+        return results;
+      });
+
+      const importedIds = insertMany(leads);
+
+      console.log(`[import] Bulk import complete: ${importedIds.length} leads imported`);
+      res.status(201).json({
+        message: `Successfully imported ${importedIds.length} leads`,
+        ids: importedIds,
+      });
+    } catch (error: any) {
+      console.error("[import] Error importing leads:", error);
+      res.status(500).json({ error: "Import failed due to an internal server error" });
+    }
+  });
+
+  app.get("/api/admin/export", (req, res) => {
+    if (!verifyAdminAuth(req)) {
+      return res.status(401).json({ error: "Invalid admin authentication credentials" });
+    }
+
+    try {
+      const leads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC").all();
+
+      const rawFilename = (req.query.filename as string) || "export.csv";
+      // Prevent path traversal by extracting basename and sanitizing
+      const safeFilename = path.basename(rawFilename).replace(/[^a-zA-Z0-9_.-]/g, "_");
+
+      const escapeCsv = (val: any) => {
+        if (val === null || val === undefined) return '""';
+        let str = String(val);
+        // Formula injection protection for spreadsheet software
+        if (/^[=+\-@]/.test(str)) {
+          str = "'" + str;
+        }
+        return `"${str.replace(/"/g, '""')}"`;
+      };
+
+      const headers = "id,name,company,email,phone,status,value,notes,created_at\n";
+      const rows = leads
+        .map((l: any) =>
+          [
+            l.id,
+            escapeCsv(l.name),
+            escapeCsv(l.company),
+            escapeCsv(l.email),
+            escapeCsv(l.phone),
+            escapeCsv(l.status),
+            typeof l.value === "number" ? l.value : 0,
+            escapeCsv(l.notes),
+            escapeCsv(l.created_at),
+          ].join(",")
+        )
+        .join("\n");
+
+      console.log(`[export] Exporting ${leads.length} leads to ${safeFilename}`);
+
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+      res.send(headers + rows);
+    } catch (error: any) {
+      console.error("[export] Error exporting leads:", error);
+      res.status(500).json({ error: "Export failed due to an internal server error" });
+    }
+  });
+
+  app.get("/api/admin/stats", (req, res) => {
+    if (!verifyAdminAuth(req)) {
+      return res.status(401).json({ error: "Invalid admin authentication credentials" });
+    }
+
+    try {
+      const totalLeads = db.prepare("SELECT COUNT(*) as count FROM leads").get() as any;
+      const byStatus = db.prepare("SELECT status, COUNT(*) as count FROM leads GROUP BY status").all();
+      const totalValue = db.prepare("SELECT SUM(value) as total FROM leads").get() as any;
+      const recentLeads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC LIMIT 10").all();
+      const totalMeetings = db.prepare("SELECT COUNT(*) as count FROM meetings").get() as any;
+
+      console.log(`[stats] Fetched admin stats. Total leads: ${totalLeads.count}`);
+
+      res.json({
+        total_leads: totalLeads.count,
+        leads_by_status: byStatus,
+        total_pipeline_value: totalValue.total || 0,
+        recent_leads: recentLeads,
+        total_meetings: totalMeetings.count,
+      });
+    } catch (error: any) {
+      console.error("[stats] Error fetching stats:", error);
+      res.status(500).json({ error: "Failed to fetch stats due to an internal server error" });
     }
   });
 
