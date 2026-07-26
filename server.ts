@@ -228,26 +228,32 @@ async function startServer() {
   });
 
   app.get("/api/leads/search", (req, res) => {
-    const query = req.query.q as string;
+    const query = req.query.q;
 
-    if (!query) {
-      return res.status(400).json({ error: "Search query is required" });
+    if (typeof query !== "string" || !query.trim()) {
+      return res.status(400).json({ error: "Search query must be a non-empty string" });
     }
 
+    const searchTerm = query.trim();
+
     try {
-      const sql = `SELECT * FROM leads WHERE name LIKE '%${query}%' OR company LIKE '%${query}%' OR email LIKE '%${query}%'`;
+      // Escape SQL LIKE wildcards (% _ \) to treat them as literal characters
+      const escapedTerm = searchTerm.replace(/[%_\\]/g, "\\$&");
+      const searchPattern = `%${escapedTerm}%`;
+      const stmt = db.prepare(`
+        SELECT * FROM leads 
+        WHERE name LIKE ? ESCAPE '\\' OR company LIKE ? ESCAPE '\\' OR email LIKE ? ESCAPE '\\'
+        ORDER BY updated_at DESC
+        LIMIT 100
+      `);
 
-      console.log(`[search] Executing query: ${sql}`);
+      const results = stmt.all(searchPattern, searchPattern, searchPattern);
 
-      const results = db.prepare(sql).all();
-
-      console.log(`[search] Found ${results.length} results for query: ${query}`);
       res.json(results);
     } catch (error: any) {
-      console.log(`[search] Error executing search: ${error.message}`);
+      console.error("[search] Database error during search execution:", error);
       res.status(500).json({
-        error: "Search failed",
-        details: error.message,
+        error: "Search failed due to an internal server error",
       });
     }
   });
