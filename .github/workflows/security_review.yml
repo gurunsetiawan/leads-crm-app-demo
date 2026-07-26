@@ -32,10 +32,14 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('code_review.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: body
-            });
+            if (fs.existsSync('code_review.md')) {
+              const body = fs.readFileSync('code_review.md', 'utf8');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body
+              });
+            } else {
+              console.log('code_review.md was not generated due to an execution error.');
+            }

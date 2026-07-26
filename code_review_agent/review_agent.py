@@ -51,6 +51,9 @@ async def log_tool_results(data: types.ToolResult):
 async def enforce_safe_tools(data: types.ToolCall) -> types.HookResult:
     print(f"[audit] calling tool={data.name} args_keys={list(data.args.keys())}", flush=True)
 
+    # Delay tool execution by 12 seconds to respect Gemini API Free Tier rate limit (5 RPM)
+    await asyncio.sleep(12)
+
     if data.name == "run_command":
         cmd = str(data.args.get("CommandLine", ""))
         if not cmd.startswith("git "):
@@ -61,7 +64,7 @@ async def enforce_safe_tools(data: types.ToolCall) -> types.HookResult:
     return types.HookResult(allow=True)
 
 async def review_code(target_dir: str) -> dict:
-    prompt = f"""Run `git diff main...HEAD -- ':!.github' ':!code_review_agent'` in {target_dir} to get the changes on this branch.
+    prompt = f"""Run `git diff origin/main...HEAD -- ':!.github' ':!code_review_agent'` (or `git diff main...HEAD` if origin/main is unavailable) in {target_dir} to get the changes on this branch.
 Review ONLY the changed code for security vulnerabilities and code quality issues.
 """
 
@@ -89,39 +92,53 @@ Review ONLY the changed code for security vulnerabilities and code quality issue
 
     config = LocalAgentConfig(**config_kwargs)
 
-    async with Agent(config) as agent:
-        response = await agent.chat(prompt)
-
-        last_step = -1
-        final_text_chunks = []
-        async for chunk in response.chunks:
-            if isinstance(chunk, types.ToolCall):
-                final_text_chunks.clear()
-            if hasattr(chunk, "text") and hasattr(chunk, "step_index"):
-                if chunk.step_index != last_step:
-                    final_text_chunks.clear()
-                    last_step = chunk.step_index
-                final_text_chunks.append(chunk.text)
-
-        final_text = "".join(final_text_chunks)
-        if final_text:
-            print(final_text)
-
-        data = await response.structured_output()
-
-        if data and "findings" in data:
-            return {"findings": data["findings"]}
-
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
         try:
-            parsed = json.loads(final_text)
-            if isinstance(parsed, list):
-                return {"findings": parsed}
-            if isinstance(parsed, dict) and "findings" in parsed:
-                return {"findings": parsed["findings"]}
-        except json.JSONDecodeError:
-            pass
+            async with Agent(config) as agent:
+                response = await agent.chat(prompt)
 
-    return {"findings": final_text}
+                last_step = -1
+                final_text_chunks = []
+                async for chunk in response.chunks:
+                    if isinstance(chunk, types.ToolCall):
+                        final_text_chunks.clear()
+                    if hasattr(chunk, "text") and hasattr(chunk, "step_index"):
+                        if chunk.step_index != last_step:
+                            final_text_chunks.clear()
+                            last_step = chunk.step_index
+                        final_text_chunks.append(chunk.text)
+
+                final_text = "".join(final_text_chunks)
+                if final_text:
+                    print(final_text)
+
+                data = await response.structured_output()
+
+                if data and "findings" in data:
+                    return {"findings": data["findings"]}
+
+                try:
+                    parsed = json.loads(final_text)
+                    if isinstance(parsed, list):
+                        return {"findings": parsed}
+                    if isinstance(parsed, dict) and "findings" in parsed:
+                        return {"findings": parsed["findings"]}
+                except json.JSONDecodeError:
+                    pass
+
+            return {"findings": final_text}
+
+        except Exception as e:
+            err_msg = str(e)
+            if "429" in err_msg or "quota" in err_msg.lower():
+                print(f"[retry] Rate limit 429 hit (attempt {attempt}/{max_retries}). Sleeping 40s...", flush=True)
+                if attempt < max_retries:
+                    await asyncio.sleep(40)
+                    continue
+            raise e
+
+    return {"findings": "Review execution failed."}
 
 
 SEVERITY_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
@@ -147,8 +164,14 @@ def format_markdown(result: dict) -> str:
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "."
-    result = asyncio.run(review_code(target))
-    markdown = format_markdown(result)
+    try:
+        result = asyncio.run(review_code(target))
+        markdown = format_markdown(result)
+    except Exception as e:
+        print(f"Review agent encountered error: {e}", file=sys.stderr)
+        markdown = f"## AI Security Review\n\n⚠️ **Review Failed**: {e}\n\n*Powered by Antigravity SDK*"
+        result = {"error": str(e)}
+
     with open(OUTPUT_FILE, "w") as f:
         f.write(markdown)
     print(f"Review written to {OUTPUT_FILE}")
